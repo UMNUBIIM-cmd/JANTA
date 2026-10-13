@@ -1,7 +1,7 @@
 {
-  "name": "janta-server",
+  "name": "concorde-server",
   "version": "1.0.0",
-  "description": "Servidor de sinalização e chat do Janta (Socket.IO)",
+  "description": "Servidor de sinalização e chat do Concorde (Socket.IO)",
   "license": "MIT",
   "private": true,
   "type": "commonjs",

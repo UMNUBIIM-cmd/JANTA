@@ -2,7 +2,7 @@
 # Suba este repositório no GitHub e, no Render, use "New +" > "Blueprint".
 services:
   - type: web
-    name: janta-server
+    name: concorde-server
     runtime: node
     plan: free
     rootDir: server

@@ -1,74 +1,66 @@
 'use strict';
 
 /**
- * Servidor do Janta.
+ * Servidor do Concorde.
  *
- * Faz duas coisas:
- *  1) Guarda servidores (guilds), canais e mensagens em memória.
- *  2) Repassa a sinalização WebRTC entre as pessoas (offer/answer/ICE) para as
- *     chamadas de voz/vídeo/tela. O áudio e o vídeo NÃO passam pelo servidor —
- *     vão direto de pessoa para pessoa (P2P). O servidor só apresenta um ao
- *     outro. Por isso ele roda tranquilo num plano grátis.
+ *  1) Guarda servidores (guilds), canais, mensagens e o cadastro de membros
+ *     (quem já entrou), em memória.
+ *  2) Repassa a sinalização WebRTC (offer/answer/ICE) entre as pessoas. Áudio e
+ *     vídeo NÃO passam pelo servidor — vão direto de pessoa para pessoa (P2P).
+ *  3) Sincroniza o mini player (tocar junto) e repassa o ping.
  *
- * Estado em memória: ao reiniciar (ou o plano grátis "dormir"), os servidores
- * criados se perdem. Para amigos é suficiente; veja o guia para persistência.
+ * Estado em memória: ao reiniciar (ou o plano grátis "dormir"), tudo se perde.
  */
 
 const http = require('http');
 const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 3001;
-const MAX_HISTORY = 100; // mensagens guardadas por canal
+const MAX_HISTORY = 100;
 const MAX_TEXT = 4000;
-const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // ~3MB em base64 cabe aqui
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_AVATAR = 400 * 1024; // avatar/ícone em dataURL (~300KB de imagem)
 const MAX_CHANNELS = 50;
 
-// ---- Estado ----------------------------------------------------------------
-/** code -> guild */
+// code -> guild
 const guilds = new Map();
-/** socketId -> { id, nick, code, voiceChannel, media } */
+// socketId -> { socketId, userId, nick, code, voiceChannel, media }
 const members = new Map();
 
 function makeCode() {
-  // Código de convite curto e fácil de digitar (ex.: "JANTA-7KQ2X").
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let s = '';
   for (let i = 0; i < 5; i++) s += alphabet[(Math.random() * alphabet.length) | 0];
-  return 'JANTA-' + s;
+  return 'CORDE-' + s;
 }
-
 function makeId(prefix) {
   return prefix + '_' + Math.random().toString(36).slice(2, 10);
 }
-
-/** Nome de canal: texto vira "minusculo-com-hifen"; voz mantém o texto. */
+function cleanNick(n) {
+  return (n || 'Visitante').toString().trim().slice(0, 32) || 'Visitante';
+}
+function cleanUserId(u) {
+  return typeof u === 'string' && /^[A-Za-z0-9_]{6,80}$/.test(u) ? u : null;
+}
+function cleanImage(v, max) {
+  return typeof v === 'string' && v.startsWith('data:image/') && v.length <= max ? v : null;
+}
 function cleanChannelName(name, type) {
   let n = (name || '').toString().trim().slice(0, 32);
   if (type === 'text') {
-    n = n
-      .toLowerCase()
-      .replace(/\s+/g, '-')
-      .replace(/[^a-z0-9à-ú_-]/gi, '')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '');
+    n = n.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9à-ú_-]/gi, '').replace(/-+/g, '-').replace(/^-|-$/g, '');
   }
   return n;
 }
-
 function emptyMedia() {
   return { muted: false, cam: false, sharing: false, micStreamId: null, camStreamId: null, screenStreamId: null, screenHasAudio: false };
 }
-
 function cleanMedia(media) {
   const id = (v) => (typeof v === 'string' && v.length > 0 && v.length <= 100 ? v : null);
   return {
-    muted: !!media.muted,
-    cam: !!media.cam,
-    sharing: !!media.sharing,
-    micStreamId: id(media.micStreamId),
-    camStreamId: id(media.camStreamId),
-    screenStreamId: id(media.screenStreamId),
-    screenHasAudio: !!media.screenHasAudio,
+    muted: !!media.muted, cam: !!media.cam, sharing: !!media.sharing,
+    micStreamId: id(media.micStreamId), camStreamId: id(media.camStreamId),
+    screenStreamId: id(media.screenStreamId), screenHasAudio: !!media.screenHasAudio,
   };
 }
 
@@ -76,28 +68,43 @@ function createGuild(name) {
   let code = makeCode();
   while (guilds.has(code)) code = makeCode();
   const guild = {
-    id: makeId('g'),
-    code,
+    id: makeId('g'), code,
     name: (name || 'Servidor').toString().slice(0, 60),
+    icon: null,
     channels: [
       { id: makeId('c'), name: 'geral', type: 'text' },
       { id: makeId('c'), name: 'bate-papo', type: 'text' },
       { id: makeId('v'), name: 'Sala de voz', type: 'voice' },
     ],
-    messages: {}, // channelId -> [msg]
-    voice: {}, // channelId -> Set(socketId)
+    messages: {},
+    voice: {},
+    roster: new Map(), // userId -> { userId, nick, avatar }
+    player: null, // { videoId, title, playing, time, at }
   };
   guilds.set(code, guild);
   return guild;
 }
 
 function publicGuild(guild) {
-  return { id: guild.id, code: guild.code, name: guild.name, channels: guild.channels };
+  return { id: guild.id, code: guild.code, name: guild.name, icon: guild.icon, channels: guild.channels };
 }
 
-function guildMembers(code) {
+/** Quem está online agora, por userId. */
+function onlineUserIds(code) {
+  const set = new Set();
+  for (const m of members.values()) if (m.code === code) set.add(m.userId);
+  return set;
+}
+
+/** Lista de membros: cadastro completo (online + offline) com avatar. */
+function guildMembers(guild) {
+  const online = onlineUserIds(guild.code);
   const list = [];
-  for (const m of members.values()) if (m.code === code) list.push({ id: m.id, nick: m.nick });
+  for (const r of guild.roster.values()) {
+    list.push({ userId: r.userId, nick: r.nick, avatar: r.avatar || null, online: online.has(r.userId) });
+  }
+  // online primeiro, depois alfabético
+  list.sort((a, b) => (a.online === b.online ? a.nick.localeCompare(b.nick) : a.online ? -1 : 1));
   return list;
 }
 
@@ -107,43 +114,35 @@ function voiceRoster(guild, channelId) {
   const peers = [];
   for (const sid of set) {
     const m = members.get(sid);
-    if (m) peers.push({ id: m.id, nick: m.nick, media: m.media });
+    if (m) {
+      const r = guild.roster.get(m.userId) || {};
+      peers.push({ id: m.socketId, userId: m.userId, nick: m.nick, avatar: r.avatar || null, media: m.media });
+    }
   }
   return peers;
 }
-
-/** Quem está em cada canal de voz (para mostrar na lista de canais). */
 function voiceState(guild) {
   const out = {};
-  for (const c of guild.channels) {
-    if (c.type === 'voice') out[c.id] = voiceRoster(guild, c.id);
-  }
+  for (const c of guild.channels) if (c.type === 'voice') out[c.id] = voiceRoster(guild, c.id);
   return out;
 }
 
-// ---- HTTP + Socket.IO ------------------------------------------------------
 const httpServer = http.createServer((req, res) => {
-  // Página simples para quem abrir o endereço no navegador / health check.
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Janta server online. Servidores ativos: ' + guilds.size);
+  res.end('Concorde server online. Servidores ativos: ' + guilds.size);
 });
 
 const io = new Server(httpServer, {
-  // O app abre via file:// (origem "null"), então liberamos a origem.
   cors: { origin: true, methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 6 * 1024 * 1024, // caber imagem em base64
+  maxHttpBufferSize: 6 * 1024 * 1024,
 });
 
-function emitVoiceState(guild) {
-  io.to(guild.code).emit('voice:state', voiceState(guild));
-}
+function emitVoiceState(guild) { io.to(guild.code).emit('voice:state', voiceState(guild)); }
+function emitMembers(guild) { io.to(guild.code).emit('members', guildMembers(guild)); }
 
 io.on('connection', (socket) => {
   socket.emit('init', { id: socket.id });
-
-  const reply = (ack, payload) => {
-    if (typeof ack === 'function') ack(payload);
-  };
+  const reply = (ack, payload) => { if (typeof ack === 'function') ack(payload); };
 
   function myGuild() {
     const me = members.get(socket.id);
@@ -159,49 +158,83 @@ io.on('connection', (socket) => {
     me.media = emptyMedia();
     if (guild && guild.voice[ch]) {
       guild.voice[ch].delete(socket.id);
-      socket.to(me.code).emit('voice:peer-left', { channelId: ch, id: me.id });
+      socket.to(me.code).emit('voice:peer-left', { channelId: ch, id: me.socketId });
       emitVoiceState(guild);
     }
   }
 
-  function enterGuild(guild, nick) {
-    const m = {
-      id: socket.id,
-      nick: (nick || 'Visitante').toString().trim().slice(0, 32) || 'Visitante',
-      code: guild.code,
-      voiceChannel: null,
-      media: emptyMedia(),
-    };
+  function enterGuild(guild, userId, nick, avatar) {
+    const r = { userId, nick, avatar: avatar || (guild.roster.get(userId) || {}).avatar || null };
+    guild.roster.set(userId, r);
+    const m = { socketId: socket.id, userId, nick, code: guild.code, voiceChannel: null, media: emptyMedia() };
     members.set(socket.id, m);
     socket.join(guild.code);
     return m;
   }
 
-  socket.on('guild:create', ({ name, nick } = {}, ack) => {
+  function joinResponse(guild, m) {
+    return {
+      ok: true, guild: publicGuild(guild), selfId: m.socketId,
+      history: guild.messages, voiceState: voiceState(guild),
+      members: guildMembers(guild), player: guild.player,
+    };
+  }
+
+  socket.on('guild:create', ({ name, nick, userId, avatar } = {}, ack) => {
+    const uid = cleanUserId(userId);
+    if (!uid) return reply(ack, { ok: false, error: 'Identidade inválida.' });
     try {
       const guild = createGuild(name);
-      const m = enterGuild(guild, nick);
-      reply(ack, { ok: true, guild: publicGuild(guild), selfId: m.id, history: {}, voiceState: voiceState(guild) });
-      io.to(guild.code).emit('members', guildMembers(guild.code));
+      const m = enterGuild(guild, uid, cleanNick(nick), cleanImage(avatar, MAX_AVATAR));
+      reply(ack, joinResponse(guild, m));
+      emitMembers(guild);
     } catch (e) {
       reply(ack, { ok: false, error: 'Falha ao criar o servidor.' });
     }
   });
 
-  socket.on('guild:join', ({ code, nick } = {}, ack) => {
+  socket.on('guild:join', ({ code, nick, userId, avatar } = {}, ack) => {
+    const uid = cleanUserId(userId);
+    if (!uid) return reply(ack, { ok: false, error: 'Identidade inválida.' });
     const guild = code ? guilds.get(code.toString().trim().toUpperCase()) : null;
-    if (!guild) {
-      reply(ack, { ok: false, error: 'Código inválido ou servidor não encontrado.' });
-      return;
-    }
-    const m = enterGuild(guild, nick);
-    reply(ack, { ok: true, guild: publicGuild(guild), selfId: m.id, history: guild.messages, voiceState: voiceState(guild) });
-    io.to(guild.code).emit('members', guildMembers(guild.code));
+    if (!guild) return reply(ack, { ok: false, error: 'Código inválido ou servidor não encontrado.' });
+    const m = enterGuild(guild, uid, cleanNick(nick), cleanImage(avatar, MAX_AVATAR));
+    reply(ack, joinResponse(guild, m));
+    emitMembers(guild);
   });
 
-  // ---- Canais --------------------------------------------------------------
-  socket.on('channel:create', ({ name, type } = {}, ack) => {
+  // ---- Perfil (apelido + foto) ----
+  socket.on('profile:update', ({ nick, avatar } = {}, ack) => {
     const [me, guild] = myGuild();
+    if (!guild) return reply(ack, { ok: false, error: 'Você não está em um servidor.' });
+    const r = guild.roster.get(me.userId) || { userId: me.userId };
+    if (nick != null) { r.nick = cleanNick(nick); me.nick = r.nick; }
+    if (avatar !== undefined) r.avatar = cleanImage(avatar, MAX_AVATAR); // null limpa
+    guild.roster.set(me.userId, r);
+    // Atualiza o apelido/foto em todos os outros servidores abertos pelo mesmo userId.
+    for (const g of guilds.values()) {
+      if (g === guild) continue;
+      const rr = g.roster.get(me.userId);
+      if (rr) { if (nick != null) rr.nick = r.nick; if (avatar !== undefined) rr.avatar = r.avatar; emitMembers(g); emitVoiceState(g); }
+    }
+    emitMembers(guild);
+    emitVoiceState(guild);
+    reply(ack, { ok: true, nick: r.nick, avatar: r.avatar || null });
+  });
+
+  // ---- Identidade do servidor (nome + ícone) ----
+  socket.on('guild:update', ({ name, icon } = {}, ack) => {
+    const [, guild] = myGuild();
+    if (!guild) return reply(ack, { ok: false, error: 'Você não está em um servidor.' });
+    if (name != null) { const n = (name || '').toString().trim().slice(0, 60); if (n) guild.name = n; }
+    if (icon !== undefined) guild.icon = cleanImage(icon, MAX_AVATAR);
+    io.to(guild.code).emit('guild:info', { code: guild.code, name: guild.name, icon: guild.icon });
+    reply(ack, { ok: true, name: guild.name, icon: guild.icon });
+  });
+
+  // ---- Canais ----
+  socket.on('channel:create', ({ name, type } = {}, ack) => {
+    const [, guild] = myGuild();
     if (!guild) return reply(ack, { ok: false, error: 'Você não está em um servidor.' });
     if (type !== 'text' && type !== 'voice') return reply(ack, { ok: false, error: 'Tipo de canal inválido.' });
     if (guild.channels.length >= MAX_CHANNELS) return reply(ack, { ok: false, error: 'Limite de canais atingido.' });
@@ -234,15 +267,13 @@ io.on('connection', (socket) => {
     if (channel.type === 'text' && guild.channels.filter((c) => c.type === 'text').length <= 1) {
       return reply(ack, { ok: false, error: 'O servidor precisa de pelo menos um canal de texto.' });
     }
-    // Quem estava nesse canal de voz é desconectado da chamada.
     if (channel.type === 'voice' && guild.voice[channelId]) {
       for (const sid of guild.voice[channelId]) {
         const m = members.get(sid);
         if (m) {
-          m.voiceChannel = null;
-          m.media = emptyMedia();
+          m.voiceChannel = null; m.media = emptyMedia();
           io.to(sid).emit('voice:force-leave', { channelId });
-          io.to(guild.code).emit('voice:peer-left', { channelId, id: m.id });
+          io.to(guild.code).emit('voice:peer-left', { channelId, id: sid });
         }
       }
       delete guild.voice[channelId];
@@ -254,95 +285,101 @@ io.on('connection', (socket) => {
     reply(ack, { ok: true });
   });
 
-  // ---- Mensagens -----------------------------------------------------------
-  socket.on('message:send', ({ channelId, text, image } = {}) => {
+  // ---- Mensagens (texto, imagem/vídeo em dataURL, ou GIF por URL) ----
+  socket.on('message:send', ({ channelId, text, image, gif } = {}) => {
     const [me, guild] = myGuild();
     if (!guild) return;
     const channel = guild.channels.find((c) => c.id === channelId && c.type === 'text');
     if (!channel) return;
-
     const cleanText = (text || '').toString().slice(0, MAX_TEXT);
     let img = null;
-    if (image && typeof image === 'string' && image.startsWith('data:')) {
-      if (image.length <= MAX_IMAGE_BYTES * 1.4) img = image; // base64 ~1.37x
-    }
-    if (!cleanText && !img) return;
-
+    if (image && typeof image === 'string' && image.startsWith('data:') && image.length <= MAX_IMAGE_BYTES * 1.4) img = image;
+    let g = null;
+    if (gif && typeof gif === 'string' && /^https:\/\/[^\s]{1,400}$/.test(gif)) g = gif;
+    if (!cleanText && !img && !g) return;
+    const r = guild.roster.get(me.userId) || {};
     const msg = {
-      id: makeId('m'),
-      channelId,
-      from: me.nick,
-      fromId: me.id,
-      text: cleanText,
-      image: img,
-      ts: Date.now(),
+      id: makeId('m'), channelId, from: me.nick, fromId: me.userId,
+      avatar: r.avatar || null, text: cleanText, image: img, gif: g, ts: Date.now(),
     };
     const arr = guild.messages[channelId] || (guild.messages[channelId] = []);
     arr.push(msg);
     if (arr.length > MAX_HISTORY) arr.splice(0, arr.length - MAX_HISTORY);
-
     io.to(me.code).emit('message:new', msg);
   });
 
-  // ---- Voz / WebRTC mesh ---------------------------------------------------
+  // ---- Voz / WebRTC mesh ----
   socket.on('voice:join', ({ channelId } = {}) => {
     const [me, guild] = myGuild();
     if (!guild) return;
     const channel = guild.channels.find((c) => c.id === channelId && c.type === 'voice');
     if (!channel) return;
-
     leaveVoice();
     me.voiceChannel = channelId;
     const set = guild.voice[channelId] || (guild.voice[channelId] = new Set());
-
-    // Envia ao recém-chegado a lista de quem já está.
     socket.emit('voice:roster', { channelId, peers: voiceRoster(guild, channelId) });
-
-    // Avisa os presentes que alguém novo chegou.
+    const r = guild.roster.get(me.userId) || {};
     socket.to(me.code).emit('voice:peer-joined', {
-      channelId,
-      peer: { id: me.id, nick: me.nick, media: me.media },
+      channelId, peer: { id: me.socketId, userId: me.userId, nick: me.nick, avatar: r.avatar || null, media: me.media },
     });
-
     set.add(socket.id);
     emitVoiceState(guild);
   });
 
   socket.on('voice:leave', () => leaveVoice());
 
-  // Repasse de sinalização (offer/answer/ICE) para um alvo específico.
   socket.on('signal', ({ to, data } = {}) => {
     const me = members.get(socket.id);
     if (!me || !to) return;
     const target = members.get(to);
-    if (!target || target.code !== me.code) return; // só dentro do mesmo servidor
-    io.to(to).emit('signal', { from: me.id, data });
+    if (!target || target.code !== me.code) return;
+    io.to(to).emit('signal', { from: me.socketId, data });
   });
 
-  // Estado de mídia (mute/câmera/transmitindo + ids das faixas) para os outros.
   socket.on('voice:media', (media = {}) => {
     const [me, guild] = myGuild();
     if (!guild) return;
     me.media = cleanMedia(media);
-    socket.to(me.code).emit('voice:peer-media', { id: me.id, media: me.media });
+    socket.to(me.code).emit('voice:peer-media', { id: me.socketId, media: me.media });
     emitVoiceState(guild);
   });
+
+  // ---- Mini player (tocar junto) ----
+  socket.on('player:set', ({ videoId, title } = {}) => {
+    const [, guild] = myGuild();
+    if (!guild) return;
+    if (!/^[A-Za-z0-9_-]{11}$/.test(videoId || '')) return;
+    guild.player = { videoId, title: (title || '').toString().slice(0, 120), playing: true, time: 0, at: Date.now() };
+    io.to(guild.code).emit('player:state', guild.player);
+  });
+  socket.on('player:control', ({ action, time } = {}) => {
+    const [, guild] = myGuild();
+    if (!guild || !guild.player) return;
+    const p = guild.player;
+    if (action === 'play') { p.playing = true; p.at = Date.now(); if (typeof time === 'number') p.time = time; }
+    else if (action === 'pause') { if (p.playing) p.time = p.time + (Date.now() - p.at) / 1000; p.playing = false; }
+    else if (action === 'seek') { p.time = Math.max(0, +time || 0); p.at = Date.now(); }
+    else if (action === 'stop') { guild.player = null; }
+    else return;
+    io.to(guild.code).emit('player:state', guild.player);
+  });
+
+  // ---- Ping (latência) ----
+  socket.on('net:ping', (t, ack) => { if (typeof ack === 'function') ack(t); });
 
   socket.on('disconnect', () => {
     const me = members.get(socket.id);
     if (!me) return;
+    const code = me.code;
+    const guild = guilds.get(code);
     leaveVoice();
     members.delete(socket.id);
-    io.to(me.code).emit('members', guildMembers(me.code));
-
-    // Limpa guild vazia depois de um tempo (evita vazamento de memória).
-    const code = me.code;
+    if (guild) emitMembers(guild);
     setTimeout(() => {
-      if (guildMembers(code).length === 0) guilds.delete(code);
-    }, 60 * 1000);
+      const g = guilds.get(code);
+      if (g && onlineUserIds(code).size === 0) guilds.delete(code);
+    }, 5 * 60 * 1000);
   });
 });
 
-httpServer.listen(PORT, () => {
-  console.log('Janta server ouvindo na porta ' + PORT);
-});
+httpServer.listen(PORT, () => console.log('Concorde server ouvindo na porta ' + PORT));
