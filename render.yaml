@@ -1,0 +1,12 @@
+# Blueprint do Render (https://render.com) — deploy gratuito em 1 clique.
+# Suba este repositório no GitHub e, no Render, use "New +" > "Blueprint".
+services:
+  - type: web
+    name: janta-server
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
